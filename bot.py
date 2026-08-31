@@ -22,6 +22,9 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).expanduser()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -544,7 +547,7 @@ async def monitor_user(
 async def main() -> None:
     config = AppConfig.from_env()
     manager = SettingsManager(
-        BASE_DIR / "settings.json",
+        DATA_DIR / "settings.json",
         config.exchanges,
         config.telegram_chat_ids,
     )
