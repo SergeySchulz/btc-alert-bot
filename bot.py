@@ -68,6 +68,7 @@ class AppConfig:
 class UserSettings:
     lower_threshold: str = "90000"
     upper_threshold: str = "110000"
+    price_levels: list[str] = field(default_factory=list)
     interval_minutes: int = 3
     notifications_enabled: bool = True
     enabled_exchanges: list[str] = field(default_factory=list)
@@ -93,6 +94,10 @@ class UserSettingsView:
     def upper(self) -> Decimal:
         return Decimal(self.data.upper_threshold)
 
+    @property
+    def levels(self) -> list[Decimal]:
+        return [Decimal(value) for value in self.data.price_levels]
+
 
 class SettingsManager:
     def __init__(self, path: Path, exchange_ids: tuple[str, ...], chat_ids: tuple[int, ...]):
@@ -106,22 +111,43 @@ class SettingsManager:
                 self.users[key] = self._defaults()
             valid = [item for item in self.users[key].enabled_exchanges if item in self.exchange_ids]
             self.users[key].enabled_exchanges = valid or list(self.exchange_ids)
+            self.users[key].price_levels = self._normalize_levels(self.users[key].price_levels)
         self.save()
+
+    def _normalize_levels(self, values: list[str]) -> list[str]:
+        normalized: set[Decimal] = set()
+        for value in values:
+            try:
+                parsed = Decimal(str(value))
+                if parsed > 0:
+                    normalized.add(parsed)
+            except InvalidOperation:
+                logger.warning("Пропущен некорректный ценовой уровень: %s", value)
+        return [str(value) for value in sorted(normalized)[:10]]
 
     def _defaults(self) -> UserSettings:
         seconds = int(os.getenv("INTERVAL_SECONDS", "180"))
         return UserSettings(
             lower_threshold=os.getenv("LOWER_THRESHOLD", "90000"),
             upper_threshold=os.getenv("UPPER_THRESHOLD", "110000"),
+            price_levels=[
+                os.getenv("LOWER_THRESHOLD", "90000"),
+                os.getenv("UPPER_THRESHOLD", "110000"),
+            ],
             interval_minutes=max(1, min(5, seconds // 60)),
             enabled_exchanges=list(self.exchange_ids),
         )
 
     def _parse(self, raw: dict[str, Any]) -> UserSettings:
         defaults = self._defaults()
+        migrated_levels = raw["price_levels"] if "price_levels" in raw else [
+            raw.get("lower_threshold", defaults.lower_threshold),
+            raw.get("upper_threshold", defaults.upper_threshold),
+        ]
         return UserSettings(
             lower_threshold=str(raw.get("lower_threshold", defaults.lower_threshold)),
             upper_threshold=str(raw.get("upper_threshold", defaults.upper_threshold)),
+            price_levels=[str(value) for value in migrated_levels],
             interval_minutes=max(1, min(5, int(raw.get("interval_minutes", defaults.interval_minutes)))),
             notifications_enabled=bool(raw.get("notifications_enabled", True)),
             enabled_exchanges=list(raw.get("enabled_exchanges", self.exchange_ids)),
@@ -151,15 +177,14 @@ class SettingsManager:
 
 
 class PriceInput(StatesGroup):
-    lower = State()
-    upper = State()
+    level = State()
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📈 Актуальная цена"), KeyboardButton(text="📊 Статус")],
-            [KeyboardButton(text="💰 Рамки цены"), KeyboardButton(text="🏦 Биржи")],
+            [KeyboardButton(text="🎯 Ценовые уровни"), KeyboardButton(text="🏦 Биржи")],
             [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="⏱ Интервал")],
         ],
         resize_keyboard=True,
@@ -167,17 +192,22 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def thresholds_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬇️ Нижняя граница", callback_data="threshold:lower")],
-        [InlineKeyboardButton(text="⬆️ Верхняя граница", callback_data="threshold:upper")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="threshold:cancel")],
+def levels_keyboard(store: UserSettingsView) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="➕ Добавить уровень", callback_data="level:add")]]
+    rows.extend([
+        [InlineKeyboardButton(
+            text=f"🗑 {format_price(level)} USDT",
+            callback_data=f"level:delete:{index}",
+        )]
+        for index, level in enumerate(store.levels)
     ])
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="level:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def threshold_cancel_keyboard() -> InlineKeyboardMarkup:
+def level_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="❌ Отменить редактирование", callback_data="threshold:cancel")
+        InlineKeyboardButton(text="❌ Отменить добавление", callback_data="level:cancel")
     ]])
 
 
@@ -223,16 +253,17 @@ async def fetch_price(exchange: Any, symbol: str) -> Decimal:
     return Decimal(str(ticker["last"]))
 
 
-def price_zone(price: Decimal, store: UserSettingsView) -> str:
-    if price > store.upper:
-        return "above"
-    if price < store.lower:
-        return "below"
-    return "normal"
-
-
 def format_price(value: Decimal) -> str:
     return f"{value:,.2f}".replace(",", " ")
+
+
+def levels_text(store: UserSettingsView) -> str:
+    if not store.levels:
+        return "Пока нет ни одного уровня."
+    return "\n".join(
+        f"{index}. 🔔 {format_price(level)} USDT"
+        for index, level in enumerate(store.levels, start=1)
+    )
 
 
 async def current_prices_text(
@@ -279,31 +310,34 @@ async def current_prices_text(
     return "\n".join(lines)
 
 
-def alert_text(exchange_id: str, symbol: str, price: Decimal, zone: str, store: UserSettingsView) -> str:
-    if zone == "above":
-        return (
-            f"🚀 {symbol} выше верхней границы на {exchange_id.upper()}\n"
-            f"Цена: {format_price(price)} USDT\nГраница: {format_price(store.upper)} USDT"
-        )
-    if zone == "below":
-        return (
-            f"⚠️ {symbol} ниже нижней границы на {exchange_id.upper()}\n"
-            f"Цена: {format_price(price)} USDT\nГраница: {format_price(store.lower)} USDT"
-        )
+def crossing_alert_text(
+    exchange_id: str,
+    symbol: str,
+    price: Decimal,
+    direction: str,
+    crossed_levels: list[Decimal],
+) -> str:
+    if direction == "up":
+        icon, title, arrow = "🚀", "ДВИЖЕНИЕ ВВЕРХ", "↗️"
+    else:
+        icon, title, arrow = "📉", "ДВИЖЕНИЕ ВНИЗ", "↘️"
+    levels = "\n".join(f"{arrow} {format_price(level)} USDT" for level in crossed_levels)
     return (
-        f"✅ {symbol} вернулся в диапазон на {exchange_id.upper()}\n"
-        f"Цена: {format_price(price)} USDT\n"
-        f"Диапазон: {format_price(store.lower)}–{format_price(store.upper)} USDT"
+        f"{icon} {title}\n\n"
+        f"₿ {symbol} · {exchange_id.upper()}\n"
+        f"Текущая цена: {format_price(price)} USDT\n\n"
+        f"Пересечённые уровни:\n{levels}"
     )
 
 
 def status_text(config: AppConfig, store: UserSettingsView) -> str:
     enabled = "включены 🔔" if store.data.notifications_enabled else "выключены 🔕"
+    levels = ", ".join(format_price(level) for level in store.levels)
+    levels_summary = f"{levels} USDT" if levels else "не заданы"
     return (
         "⚙️ Текущие настройки\n\n"
         f"Пара: {config.symbol}\n"
-        f"Нижняя граница: {format_price(store.lower)} USDT\n"
-        f"Верхняя граница: {format_price(store.upper)} USDT\n"
+        f"Ценовые уровни ({len(store.levels)}): {levels_summary}\n"
         f"Интервал: {store.data.interval_minutes} мин.\n"
         f"Уведомления: {enabled}\n"
         f"Активные биржи: {', '.join(item.upper() for item in store.data.enabled_exchanges)}"
@@ -383,8 +417,8 @@ def build_router(
         )
         await query.answer("Настройка сохранена")
 
-    @router.message(F.text == "💰 Рамки цены")
-    async def thresholds(message: Message, state: FSMContext) -> None:
+    @router.message(F.text.in_({"🎯 Ценовые уровни", "💰 Рамки цены"}))
+    async def price_levels(message: Message, state: FSMContext) -> None:
         if not is_allowed(message, config):
             return
         store = manager.for_chat(message.chat.id)
@@ -392,66 +426,95 @@ def build_router(
         waiting = await message.answer("⏳ Получаю актуальную цену...")
         price_report = await current_prices_text(config, store, exchanges)
         await waiting.edit_text(
-            price_report + "\n\nКакую границу изменить?",
-            reply_markup=thresholds_keyboard(),
+            price_report
+            + "\n\n🎯 ВАШИ ЦЕНОВЫЕ УРОВНИ\n"
+            + levels_text(store)
+            + "\n\nБот сообщит о пересечении любого уровня вверх или вниз.",
+            reply_markup=levels_keyboard(store),
         )
 
-    @router.callback_query(F.data.in_({"threshold:lower", "threshold:upper"}))
-    async def threshold_choice(query: CallbackQuery, state: FSMContext) -> None:
+    @router.callback_query(F.data == "level:add")
+    async def level_add(query: CallbackQuery, state: FSMContext) -> None:
         if not is_allowed(query, config):
             return
-        kind = query.data.split(":", 1)[1]
-        await state.set_state(PriceInput.lower if kind == "lower" else PriceInput.upper)
-        label = "нижнюю" if kind == "lower" else "верхнюю"
+        store = manager.for_chat(query.message.chat.id)
+        if len(store.levels) >= 10:
+            await query.answer("Можно добавить не более 10 уровней", show_alert=True)
+            return
+        await state.set_state(PriceInput.level)
         await query.message.answer(
-            f"Введите {label} границу в USDT одним числом, например: 95000",
-            reply_markup=threshold_cancel_keyboard(),
+            "➕ НОВЫЙ ЦЕНОВОЙ УРОВЕНЬ\n\n"
+            "Введите цену BTC в USDT одним числом.\n"
+            "Например: 95000",
+            reply_markup=level_cancel_keyboard(),
         )
         await query.answer()
 
-    @router.callback_query(F.data == "threshold:cancel")
-    async def threshold_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    @router.callback_query(F.data.startswith("level:delete:"))
+    async def level_delete(query: CallbackQuery) -> None:
+        if not is_allowed(query, config):
+            return
+        store = manager.for_chat(query.message.chat.id)
+        try:
+            index = int(query.data.rsplit(":", 1)[1])
+            deleted = store.levels[index]
+        except (ValueError, IndexError):
+            await query.answer("Список уже изменился. Откройте уровни заново.", show_alert=True)
+            return
+        del store.data.price_levels[index]
+        store.save()
+        reset_monitor(query.message.chat.id)
+        await query.message.edit_text(
+            "🎯 ВАШИ ЦЕНОВЫЕ УРОВНИ\n"
+            + levels_text(store)
+            + "\n\nНажмите на уровень с 🗑, чтобы удалить его.",
+            reply_markup=levels_keyboard(store),
+        )
+        await query.answer(f"Удалён уровень {format_price(deleted)} USDT")
+
+    @router.callback_query(F.data.in_({"level:cancel", "level:close"}))
+    async def level_close(query: CallbackQuery, state: FSMContext) -> None:
         if not is_allowed(query, config):
             return
         await state.clear()
-        await query.message.edit_text("❌ Редактирование рамок отменено. Настройки не изменены.")
-        await query.answer("Отменено")
+        text = "❌ Добавление отменено." if query.data == "level:cancel" else "✅ Ценовые уровни сохранены."
+        await query.message.edit_text(text)
+        await query.answer()
 
-    async def save_threshold(message: Message, state: FSMContext, kind: str) -> None:
+    @router.message(PriceInput.level)
+    async def level_input(message: Message, state: FSMContext) -> None:
         if not is_allowed(message, config):
             return
         store = manager.for_chat(message.chat.id)
         try:
             value = Decimal((message.text or "").replace(" ", "").replace(",", "."))
         except InvalidOperation:
-            await message.answer("Не получилось распознать число. Введите, например: 95000")
+            await message.answer(
+                "Не получилось распознать число. Введите, например: 95000",
+                reply_markup=level_cancel_keyboard(),
+            )
             return
         if value <= 0:
             await message.answer("Цена должна быть больше нуля.")
             return
-        if kind == "lower" and value >= store.upper:
-            await message.answer("Нижняя граница должна быть меньше верхней.")
+        if value in store.levels:
+            await message.answer("Такой уровень уже есть. Введите другую цену.")
             return
-        if kind == "upper" and value <= store.lower:
-            await message.answer("Верхняя граница должна быть больше нижней.")
+        if len(store.levels) >= 10:
+            await state.clear()
+            await message.answer("Можно добавить не более 10 уровней.", reply_markup=main_keyboard())
             return
 
-        if kind == "lower":
-            store.data.lower_threshold = str(value)
-        else:
-            store.data.upper_threshold = str(value)
+        store.data.price_levels = [str(level) for level in sorted([*store.levels, value])]
         store.save()
         reset_monitor(message.chat.id)
         await state.clear()
-        await message.answer("✅ Граница сохранена.\n\n" + status_text(config, store), reply_markup=main_keyboard())
-
-    @router.message(PriceInput.lower)
-    async def lower_input(message: Message, state: FSMContext) -> None:
-        await save_threshold(message, state, "lower")
-
-    @router.message(PriceInput.upper)
-    async def upper_input(message: Message, state: FSMContext) -> None:
-        await save_threshold(message, state, "upper")
+        await message.answer(
+            f"✅ Уровень {format_price(value)} USDT добавлен.\n\n"
+            "🎯 ВАШИ ЦЕНОВЫЕ УРОВНИ\n"
+            + levels_text(store),
+            reply_markup=levels_keyboard(store),
+        )
 
     @router.message(F.text == "🔔 Уведомления")
     async def notifications(message: Message) -> None:
@@ -500,7 +563,7 @@ async def monitor_user(
     manager: SettingsManager,
     exchanges: dict[str, Any],
     chat_id: int,
-    last_zones: dict[str, str],
+    last_prices: dict[str, Decimal],
     wake_event: asyncio.Event,
 ) -> None:
     while True:
@@ -511,8 +574,8 @@ async def monitor_user(
                 for exchange_id, exchange in exchanges.items()
                 if exchange_id in store.data.enabled_exchanges
             ]
-            for exchange_id in set(last_zones) - set(store.data.enabled_exchanges):
-                last_zones.pop(exchange_id, None)
+            for exchange_id in set(last_prices) - set(store.data.enabled_exchanges):
+                last_prices.pop(exchange_id, None)
             results = await asyncio.gather(
                 *(fetch_price(exchange, config.symbol) for _, exchange in enabled_items),
                 return_exceptions=True,
@@ -522,19 +585,23 @@ async def monitor_user(
                     logger.error("Ошибка %s: %s", exchange_id, result)
                     continue
                 price = result
-                zone = price_zone(price, store)
-                previous = last_zones.get(exchange_id)
-                logger.info("%s %s = %s, зона: %s", exchange_id, config.symbol, price, zone)
+                previous = last_prices.get(exchange_id)
+                logger.info("%s %s = %s", exchange_id, config.symbol, price)
 
-                if store.data.notifications_enabled:
-                    crossed = previous is not None and zone != previous
-                    first_outside = previous is None and zone != "normal"
-                    if crossed or first_outside:
+                if store.data.notifications_enabled and previous is not None:
+                    crossed_up = [level for level in store.levels if previous < level <= price]
+                    crossed_down = [level for level in reversed(store.levels) if previous > level >= price]
+                    if crossed_up:
                         await bot.send_message(
                             chat_id,
-                            alert_text(exchange_id, config.symbol, price, zone, store),
+                            crossing_alert_text(exchange_id, config.symbol, price, "up", crossed_up),
                         )
-                last_zones[exchange_id] = zone
+                    elif crossed_down:
+                        await bot.send_message(
+                            chat_id,
+                            crossing_alert_text(exchange_id, config.symbol, price, "down", crossed_down),
+                        )
+                last_prices[exchange_id] = price
         except Exception:
             logger.exception("Ошибка мониторинга пользователя %s", chat_id)
         try:
@@ -552,11 +619,11 @@ async def main() -> None:
         config.telegram_chat_ids,
     )
     exchanges = {exchange_id: create_exchange(exchange_id) for exchange_id in config.exchanges}
-    last_zones: dict[int, dict[str, str]] = {chat_id: {} for chat_id in config.telegram_chat_ids}
+    last_prices: dict[int, dict[str, Decimal]] = {chat_id: {} for chat_id in config.telegram_chat_ids}
     wake_events: dict[int, asyncio.Event] = {chat_id: asyncio.Event() for chat_id in config.telegram_chat_ids}
 
     def reset_monitor(chat_id: int) -> None:
-        last_zones[chat_id].clear()
+        last_prices[chat_id].clear()
         wake_events[chat_id].set()
 
     bot = Bot(token=config.telegram_bot_token)
@@ -564,7 +631,7 @@ async def main() -> None:
     dispatcher.include_router(build_router(config, manager, exchanges, reset_monitor))
     monitor_tasks = [
         asyncio.create_task(
-            monitor_user(bot, config, manager, exchanges, chat_id, last_zones[chat_id], wake_events[chat_id])
+            monitor_user(bot, config, manager, exchanges, chat_id, last_prices[chat_id], wake_events[chat_id])
         )
         for chat_id in config.telegram_chat_ids
     ]
