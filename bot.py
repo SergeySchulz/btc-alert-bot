@@ -331,6 +331,14 @@ async def fetch_price(exchange: Any, symbol: str) -> Decimal:
     return Decimal(str(ticker["last"]))
 
 
+def median_price(values: list[Decimal]) -> Decimal:
+    sorted_values = sorted(values)
+    middle = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[middle]
+    return (sorted_values[middle - 1] + sorted_values[middle]) / 2
+
+
 def format_price(value: Decimal) -> str:
     return f"{value:,.2f}".replace(",", " ")
 
@@ -366,12 +374,7 @@ async def current_prices_text(
     if not prices:
         return "⚠️ Не удалось получить актуальную цену. Попробуйте ещё раз немного позже."
 
-    sorted_values = sorted(price for _, price in prices)
-    middle = len(sorted_values) // 2
-    if len(sorted_values) % 2:
-        common_price = sorted_values[middle]
-    else:
-        common_price = (sorted_values[middle - 1] + sorted_values[middle]) / 2
+    common_price = median_price([price for _, price in prices])
 
     lines = [
         "₿ BTC / USDT",
@@ -389,23 +392,30 @@ async def current_prices_text(
 
 
 def crossing_alert_text(
-    exchange_id: str,
     symbol: str,
-    price: Decimal,
+    common_price: Decimal,
+    prices: list[tuple[str, Decimal]],
     direction: str,
     crossed_levels: list[Decimal],
+    failed: list[str] | None = None,
 ) -> str:
     if direction == "up":
         icon, title, arrow = "🚀", "ДВИЖЕНИЕ ВВЕРХ", "↗️"
     else:
         icon, title, arrow = "📉", "ДВИЖЕНИЕ ВНИЗ", "↘️"
     levels = "\n".join(f"{arrow} {format_price(level)} USDT" for level in crossed_levels)
-    return (
-        f"{icon} {title}\n\n"
-        f"₿ {symbol} · {exchange_id.upper()}\n"
-        f"Текущая цена: {format_price(price)} USDT\n\n"
-        f"Пересечённые уровни:\n{levels}"
+    exchange_lines = "\n".join(
+        f"• {exchange_id.upper()}: {format_price(price)} USDT" for exchange_id, price in prices
     )
+    text = (
+        f"{icon} {title}\n\n"
+        f"₿ {symbol}\n"
+        f"Общий курс: {format_price(common_price)} USDT\n\n"
+        f"Цены на биржах:\n{exchange_lines}\n"
+    )
+    if failed:
+        text += f"Нет ответа: {', '.join(failed)}\n"
+    return text + f"\nПересечённые уровни:\n{levels}"
 
 
 def status_text(config: AppConfig, store: UserSettingsView) -> str:
@@ -635,6 +645,9 @@ def build_router(
     return router
 
 
+COMMON_PRICE_KEY = "common"
+
+
 async def monitor_user(
     bot: Bot,
     config: AppConfig,
@@ -654,35 +667,44 @@ async def monitor_user(
                 for exchange_id, exchange in exchanges.items()
                 if exchange_id in store.data.enabled_exchanges
             ]
-            for exchange_id in set(last_prices) - set(store.data.enabled_exchanges):
-                last_prices.pop(exchange_id, None)
             results = await asyncio.gather(
                 *(fetch_price(exchange, config.symbol) for _, exchange in enabled_items),
                 return_exceptions=True,
             )
-            success = any(not isinstance(result, BaseException) for result in results)
+            prices: list[tuple[str, Decimal]] = []
+            failed: list[str] = []
             for (exchange_id, _), result in zip(enabled_items, results):
                 if isinstance(result, BaseException):
                     logger.error("Ошибка %s: %s", exchange_id, result)
+                    failed.append(exchange_id.upper())
                     continue
-                price = result
-                previous = last_prices.get(exchange_id)
-                logger.info("%s %s = %s", exchange_id, config.symbol, price)
+                logger.info("%s %s = %s", exchange_id, config.symbol, result)
+                prices.append((exchange_id, result))
 
+            success = bool(prices)
+            if prices:
+                # Пересечение уровней определяется по общему курсу (медиане бирж),
+                # поэтому на одно движение цены приходит одно сообщение со всеми биржами.
+                common_price = median_price([price for _, price in prices])
+                previous = last_prices.get(COMMON_PRICE_KEY)
+                logger.info("Общий курс %s = %s", config.symbol, common_price)
                 if store.data.notifications_enabled and previous is not None:
-                    crossed_up = [level for level in store.levels if previous < level <= price]
-                    crossed_down = [level for level in reversed(store.levels) if previous > level >= price]
-                    if crossed_up:
+                    crossed_up = [level for level in store.levels if previous < level <= common_price]
+                    crossed_down = [level for level in reversed(store.levels) if previous > level >= common_price]
+                    direction = "up" if crossed_up else "down" if crossed_down else None
+                    if direction:
                         await bot.send_message(
                             chat_id,
-                            crossing_alert_text(exchange_id, config.symbol, price, "up", crossed_up),
+                            crossing_alert_text(
+                                config.symbol,
+                                common_price,
+                                prices,
+                                direction,
+                                crossed_up or crossed_down,
+                                failed,
+                            ),
                         )
-                    elif crossed_down:
-                        await bot.send_message(
-                            chat_id,
-                            crossing_alert_text(exchange_id, config.symbol, price, "down", crossed_down),
-                        )
-                last_prices[exchange_id] = price
+                last_prices[COMMON_PRICE_KEY] = common_price
         except Exception:
             logger.exception("Ошибка мониторинга пользователя %s", chat_id)
         health.cycle_finished(chat_id, success, store.data.interval_minutes * 60)
