@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
+import time
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -174,6 +177,81 @@ class SettingsManager:
 
     def for_chat(self, chat_id: int) -> UserSettingsView:
         return UserSettingsView(self, chat_id)
+
+
+class HealthMonitor:
+    """Пингует сервис мониторинга (healthchecks.io) и перезапускает бота при зависании.
+
+    Работает в отдельном потоке, поэтому срабатывает, даже если основной цикл asyncio
+    полностью заблокирован. Пинг уходит, только пока бот реально получает цены:
+    если бот упал, завис или не может достучаться до бирж, пинги прекращаются
+    и сервис мониторинга присылает тревогу.
+    """
+
+    def __init__(self, url: str, stall_seconds: int, ping_seconds: int = 60):
+        self.url = url.strip().rstrip("/")
+        self.stall_seconds = stall_seconds
+        self.ping_seconds = ping_seconds
+        self._lock = threading.Lock()
+        self._last_cycle: dict[int, float] = {}
+        self._intervals: dict[int, int] = {}
+        self._last_success: float | None = None
+
+    def register(self, chat_id: int, interval_seconds: int) -> None:
+        with self._lock:
+            self._last_cycle[chat_id] = time.monotonic()
+            self._intervals[chat_id] = interval_seconds
+
+    def cycle_finished(self, chat_id: int, success: bool, interval_seconds: int) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._last_cycle[chat_id] = now
+            self._intervals[chat_id] = interval_seconds
+            if success:
+                self._last_success = now
+
+    def start(self) -> None:
+        if not self.url and self.stall_seconds <= 0:
+            return
+        if self.url:
+            logger.info("Мониторинг работоспособности включён")
+        if self.stall_seconds > 0:
+            logger.info("Сторож зависаний включён: перезапуск после %s мин. без проверок", self.stall_seconds // 60)
+        threading.Thread(target=self._run, name="health-monitor", daemon=True).start()
+
+    def _ping(self, suffix: str = "", message: str = "") -> None:
+        if not self.url:
+            return
+        request = urllib.request.Request(
+            self.url + suffix,
+            data=message.encode("utf-8") if message else None,
+            method="POST" if message else "GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                pass
+        except Exception as exc:
+            logger.warning("Не удалось отправить пинг мониторинга: %s", exc)
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.ping_seconds)
+            now = time.monotonic()
+            with self._lock:
+                oldest_cycle = min(self._last_cycle.values(), default=now)
+                max_interval = max(self._intervals.values(), default=300)
+                last_success = self._last_success
+
+            stalled_for = now - oldest_cycle
+            if self.stall_seconds > 0 and stalled_for > self.stall_seconds:
+                text = f"Проверка цены не завершалась {int(stalled_for // 60)} мин. Бот завис и перезапускается."
+                logger.error(text)
+                self._ping("/fail", text)
+                logging.shutdown()
+                os._exit(1)
+
+            if last_success is not None and now - last_success <= max_interval + 120:
+                self._ping()
 
 
 class PriceInput(StatesGroup):
@@ -565,9 +643,11 @@ async def monitor_user(
     chat_id: int,
     last_prices: dict[str, Decimal],
     wake_event: asyncio.Event,
+    health: HealthMonitor,
 ) -> None:
     while True:
         store = manager.for_chat(chat_id)
+        success = False
         try:
             enabled_items = [
                 (exchange_id, exchange)
@@ -580,6 +660,7 @@ async def monitor_user(
                 *(fetch_price(exchange, config.symbol) for _, exchange in enabled_items),
                 return_exceptions=True,
             )
+            success = any(not isinstance(result, BaseException) for result in results)
             for (exchange_id, _), result in zip(enabled_items, results):
                 if isinstance(result, BaseException):
                     logger.error("Ошибка %s: %s", exchange_id, result)
@@ -604,6 +685,7 @@ async def monitor_user(
                 last_prices[exchange_id] = price
         except Exception:
             logger.exception("Ошибка мониторинга пользователя %s", chat_id)
+        health.cycle_finished(chat_id, success, store.data.interval_minutes * 60)
         try:
             await asyncio.wait_for(wake_event.wait(), timeout=store.data.interval_minutes * 60)
             wake_event.clear()
@@ -626,12 +708,22 @@ async def main() -> None:
         last_prices[chat_id].clear()
         wake_events[chat_id].set()
 
+    health = HealthMonitor(
+        url=os.getenv("HEALTHCHECK_URL", ""),
+        stall_seconds=int(os.getenv("WATCHDOG_MINUTES", "15")) * 60,
+    )
+    for chat_id in config.telegram_chat_ids:
+        health.register(chat_id, manager.for_chat(chat_id).data.interval_minutes * 60)
+    health.start()
+
     bot = Bot(token=config.telegram_bot_token)
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(build_router(config, manager, exchanges, reset_monitor))
     monitor_tasks = [
         asyncio.create_task(
-            monitor_user(bot, config, manager, exchanges, chat_id, last_prices[chat_id], wake_events[chat_id])
+            monitor_user(
+                bot, config, manager, exchanges, chat_id, last_prices[chat_id], wake_events[chat_id], health
+            )
         )
         for chat_id in config.telegram_chat_ids
     ]
